@@ -23,31 +23,33 @@ It's my hobby project. I plan to learn some basic micropython programming on my 
 ## `main.py` (final version)
 
 ```python
-# main.py  –  Pico GPS-OLED: two-line readout + heartbeat, watchdog, crash log
-# Wiring:
-#   GP0 SDA  | GP1 SCL  → 128×32 SSD1306 (I2C-0, addr 0x3C)
-#   GP4 TX   | GP5 RX   → GPS @ 9600 bps  (UART-1)
+# main.py  –  Pico GPS-OLED with heartbeat, watchdog & crash-log
+# Pins (change if wired differently):
+#   I²C-0   GP0 SDA, GP1 SCL  → SSD1306 (0x3C)
+#   UART-1  GP4 TX,  GP5 RX   → GPS @ 9600 bps
 
 from machine import Pin, I2C, UART, WDT
 import utime, math, gc, framebuf, ssd1306
 
-# --- pins & settings --------------------------------------------------
+# ── configurable pins & constants ────────────────────────────────
 SDA_PIN, SCL_PIN, OLED_ADDR = 0, 1, 0x3C
 UART_ID,  TX_PIN, RX_PIN    = 1, 4, 5
 GPS_BAUD                    = 9600
-WATCHDOG_MS                 = 8000          # 8 s
 LOG_PATH                    = "exception.log"
-CHAR_W                      = 8             # 8×8 font char width
-# ----------------------------------------------------------------------
+WATCHDOG_MS                 = 8000          # 8 s watchdog
+# ─────────────────────────────────────────────────────────────────
 
+# peripherals
 i2c  = I2C(0, sda=Pin(SDA_PIN), scl=Pin(SCL_PIN), freq=400_000)
 oled = ssd1306.SSD1306_I2C(128, 32, i2c, addr=OLED_ADDR)
 uart = UART(UART_ID, GPS_BAUD, tx=Pin(TX_PIN), rx=Pin(RX_PIN), timeout=300)
-led  = Pin(25, Pin.OUT)      # on-board LED
+led  = Pin(25, Pin.OUT)        # on-board LED
 wdt  = WDT(timeout=WATCHDOG_MS)
 
-# ---------- helpers ---------------------------------------------------
-def dm_to_dd(dm, hemi):
+CHAR_W = 8                     # width of 8×8 font
+
+# ── helper functions ────────────────────────────────────────────
+def dm_to_dd(dm: str, hemi: str):
     if not dm:
         return None
     dot = dm.find('.')
@@ -56,122 +58,150 @@ def dm_to_dd(dm, hemi):
     dd = deg + minutes / 60
     return -dd if hemi in ('S', 'W') else dd
 
-def fmt_deg(dd, hemi_pair=('N', 'S')):
-    return '--' if dd is None else f"{abs(dd):.4f}{hemi_pair[0] if dd >= 0 else hemi_pair[1]}"
+def fmt_deg(dd: float, hemi=('N', 'S')):
+    return '--' if dd is None else f"{abs(dd):.4f}{hemi[0] if dd >= 0 else hemi[1]}"
 
-def safe_time_to_sec(t):
-    if not t or len(t) < 6 or not t[:6].isdigit():
+# ---------- robust NMEA parser ------------------------------------------
+def safe_time_to_sec(timestr):
+    """
+    Convert hhmmss[.sss] to seconds after midnight.
+    Returns None if the string is malformed.
+    """
+    if not timestr or len(timestr) < 6 or not timestr[0:6].isdigit():
         return None
     try:
-        hh, mm, ss = int(t[:2]), int(t[2:4]), float(t[4:])
-        return hh*3600 + mm*60 + ss
+        hh = int(timestr[0:2])
+        mm = int(timestr[2:4])
+        ss = float(timestr[4:])
+        return hh * 3600 + mm * 60 + ss
     except ValueError:
         return None
 
-def parse_nmea(line):
-    """Return dict(lat, lon, time_s, sats, fix_valid)."""
-    if not line.startswith('$'):
+
+def parse_nmea(line: str):
+    """
+    Parse $GxGGA / $GxRMC.
+    Returns dict(lat, lon, time_s, sats, fix_valid); keys absent if unknown.
+    Never raises ValueError or IndexError.
+    """
+    if not line.startswith("$"):
         return {}
-    p, tag, d = line.split(','), line[-3:], {}
+
+    p   = line.split(",")
+    tag = p[0][-3:]
+    d   = {}
+
     try:
-        if tag == 'GGA' and len(p) >= 10:
-            d['sats'] = int(p[7] or 0)
-            d['fix_valid'] = p[6] != '0'
-            if d['fix_valid']:
-                d['lat'] = dm_to_dd(p[2], p[3]) if p[2] and p[3] else None
-                d['lon'] = dm_to_dd(p[4], p[5]) if p[4] and p[5] else None
-                d['time_s'] = safe_time_to_sec(p[1])
-        elif tag == 'RMC' and len(p) >= 7:
-            d['fix_valid'] = p[2] == 'A'
-            if d['fix_valid']:
-                d['lat'] = dm_to_dd(p[3], p[4]) if p[3] and p[4] else None
-                d['lon'] = dm_to_dd(p[5], p[6]) if p[5] and p[6] else None
-                d['time_s'] = safe_time_to_sec(p[1])
+        if tag == "GGA" and len(p) >= 10:
+            d["sats"]      = int(p[7] or 0)
+            d["fix_valid"] = p[6] != "0"
+            if d["fix_valid"]:
+                d["lat"] = dm_to_dd(p[2], p[3]) if p[2] and p[3] else None
+                d["lon"] = dm_to_dd(p[4], p[5]) if p[4] and p[5] else None
+                tsec = safe_time_to_sec(p[1])
+                if tsec is not None:
+                    d["time_s"] = tsec
+
+        elif tag == "RMC" and len(p) >= 7:
+            d["fix_valid"] = p[2] == "A"
+            if d["fix_valid"]:
+                d["lat"] = dm_to_dd(p[3], p[4]) if p[3] and p[4] else None
+                d["lon"] = dm_to_dd(p[5], p[6]) if p[5] and p[6] else None
+                tsec = safe_time_to_sec(p[1])
+                if tsec is not None:
+                    d["time_s"] = tsec
     except (ValueError, IndexError):
+        # Anything malformed is ignored silently; caller just gets {}.
         return {}
+
     return d
 
 def haversine(lat1, lon1, lat2, lon2):
-    R = 6_371_000.0
-    φ1, φ2 = math.radians(lat1), math.radians(lat2)
-    dφ = φ2 - φ1
-    dλ = math.radians(lon2 - lon1)
-    a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
-    return 2 * R * math.asin(math.sqrt(a))
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi   = p2 - p1
+    dlamb  = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlamb/2)**2
+    return 2*R*math.asin(math.sqrt(a))
 
-def sat_icon(buf, x, y):
-    buf.fill_rect(x+1, y+1, 3, 3, 1)
-    buf.pixel(x, y+1, 1); buf.pixel(x, y+2, 1); buf.pixel(x, y+3, 1)
-    buf.pixel(x+4, y+1, 1); buf.pixel(x+4, y+2, 1); buf.pixel(x+4, y+3, 1)
-    buf.pixel(x+2, y, 1); buf.pixel(x+2, y+4, 1)
+def sat_icon(fb: framebuf.FrameBuffer, x, y):
+    fb.fill_rect(x+1, y+1, 3, 3, 1)
+    fb.pixel(x, y+1, 1); fb.pixel(x, y+2, 1); fb.pixel(x, y+3, 1)
+    fb.pixel(x+4, y+1, 1); fb.pixel(x+4, y+2, 1); fb.pixel(x+4, y+3, 1)
+    fb.pixel(x+2, y, 1);   fb.pixel(x+2, y+4, 1)
 
-def log_exc(e):
+def log_exception(e):
     try:
-        with open(LOG_PATH, 'a') as f:
-            f.write(f"{utime.time()} {repr(e)}\n")
+        with open(LOG_PATH, "a") as f:
+            f.write("{} {}\n".format(utime.time(), repr(e)))
     except OSError:
         pass
-# ----------------------------------------------------------------------
 
-state = dict(lat=None, lon=None, sats=0, fix=False,
-             prev_lat=None, prev_lon=None, prev_t=None,
-             speed=0.0)
+# ── runtime state ───────────────────────────────────────────────
+st = dict(lat=None, lon=None, sats=0, fix=False,
+          prev_lat=None, prev_lon=None, prev_t=None,
+          speed=0.0)
 
-# ---------- main loop --------------------------------------------------
+# ── main loop ───────────────────────────────────────────────────
 while True:
     try:
-        # UART read (non-blocking)
-        rb = uart.readline()
-        if rb:
+        # -------- read UART non-blocking --------
+        raw_bytes = uart.readline()
+        if raw_bytes:
             try:
-                raw = rb.decode().strip()
+                raw = raw_bytes.decode().strip()  # no keyword args
             except UnicodeError:
                 raw = ''
-            u = parse_nmea(raw)
-            if 'sats' in u and u['sats'] is not None:
-                state['sats'] = u['sats']
-            if u.get('fix_valid'):
-                lat, lon, t = u.get('lat'), u.get('lon'), u.get('time_s')
-                if all(v is not None for v in (lat, lon, t)):
-                    if state['prev_lat'] is not None:
-                        d = haversine(state['prev_lat'], state['prev_lon'], lat, lon)
-                        dt = t - state['prev_t']
-                        if dt < 0:
-                            dt += 86400      # midnight rollover
-                        state['speed'] = d/dt if dt else 0.0
-                    state['prev_lat'], state['prev_lon'], state['prev_t'] = lat, lon, t
-                state['lat'], state['lon'], state['fix'] = lat, lon, True
+            upd = parse_nmea(raw)
 
-        # ---------------- OLED ----------------
+            if 'sats' in upd and upd['sats'] is not None:
+                st['sats'] = upd['sats']
+
+            if upd.get('fix_valid'):
+                lat, lon, t = upd.get('lat'), upd.get('lon'), upd.get('time_s')
+                if all(v is not None for v in (lat, lon, t)):
+                    if st['prev_lat'] is not None:
+                        dist = haversine(st['prev_lat'], st['prev_lon'], lat, lon)
+                        dt   = t - st['prev_t']
+                        if dt < 0:
+                            dt += 86400         # midnight wrap
+                        st['speed'] = dist/dt if dt > 0 else 0.0
+                    st['prev_lat'], st['prev_lon'], st['prev_t'] = lat, lon, t
+                st['lat'], st['lon'], st['fix'] = lat, lon, True
+
+        # -------- render OLED --------
         oled.fill(0)
-        if not state['fix']:
+        if not st['fix']:
             oled.text('NO FIX', 0, 12)
-            oled.text(f'Sat:{state["sats"]}', 0, 22)
+            oled.text(f'Sat:{st["sats"]}', 0, 22)
         else:
-            # row 1
-            oled.text(fmt_deg(state['lat'], ('N','S')), 0, 0)
-            sp = f'{state["speed"]:.1f}m/s'
-            oled.text(sp, 128 - CHAR_W*len(sp), 0)
-            # row 2
-            oled.text(fmt_deg(state['lon'], ('E','W')), 0, 16)
-            sat_s = str(state['sats'])
+            # row 1: latitude + speed
+            left1  = fmt_deg(st['lat'], ('N', 'S'))
+            sp_txt = f'{st["speed"]:.1f}m/s'
+            oled.text(left1, 0, 0)
+            oled.text(sp_txt, 128 - CHAR_W*len(sp_txt), 0)
+            # row 2: longitude + satellites
+            left2  = fmt_deg(st['lon'], ('E', 'W'))
+            sat_s  = str(st['sats'])
             icon_x = 128 - CHAR_W*len(sat_s) - 7
             sat_icon(oled, icon_x, 16)
             oled.text(sat_s, icon_x + 7, 16)
+            oled.text(left2, 0, 16)
         oled.show()
 
-        # housekeeping
-        led.toggle()     # heartbeat
-        wdt.feed()
+        # -------- housekeeping --------
+        led.toggle()      # heartbeat blink
+        wdt.feed()        # reset watchdog timer
         gc.collect()
-        utime.sleep_ms(60)
+        utime.sleep_ms(100)
 
     except Exception as e:
-        log_exc(e)
-        led.on()                       # solid LED for 2 s
+        log_exception(e)  # store traceback in flash
+        led.on()          # solid LED for 2 s signals error
         oled.fill(0); oled.text('ERR', 0, 12); oled.show()
         utime.sleep(2)
         led.off()
+
 ```
 
 **Usage**
